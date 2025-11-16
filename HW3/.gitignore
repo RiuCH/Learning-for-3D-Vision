@@ -129,7 +129,6 @@ dmypy.json
 .pyre/
 
 .png
-images/
 data/
 outputs/
 checkpoints*
