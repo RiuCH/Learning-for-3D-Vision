@@ -1,0 +1,486 @@
+import torch
+import torch.nn.functional as F
+from torch import autograd
+import torch.nn as nn
+from ray_utils import RayBundle
+from functools import reduce
+
+# Sphere SDF class
+class SphereSDF(torch.nn.Module):
+    def __init__(
+        self,
+        cfg
+    ):
+        super().__init__()
+
+        self.radius = torch.nn.Parameter(
+            torch.tensor(cfg.radius.val).float(), requires_grad=cfg.radius.opt
+        )
+        self.center = torch.nn.Parameter(
+            torch.tensor(cfg.center.val).float().unsqueeze(0), requires_grad=cfg.center.opt
+        )
+
+    def forward(self, points):
+        points = points.view(-1, 3)
+
+        return torch.linalg.norm(
+            points - self.center,
+            dim=-1,
+            keepdim=True
+        ) - self.radius
+
+
+# Box SDF class
+class BoxSDF(torch.nn.Module):
+    def __init__(
+        self,
+        cfg
+    ):
+        super().__init__()
+
+        self.center = torch.nn.Parameter(
+            torch.tensor(cfg.center.val).float().unsqueeze(0), requires_grad=cfg.center.opt
+        )
+        self.side_lengths = torch.nn.Parameter(
+            torch.tensor(cfg.side_lengths.val).float().unsqueeze(0), requires_grad=cfg.side_lengths.opt
+        )
+
+    def forward(self, points):
+        points = points.view(-1, 3)
+        diff = torch.abs(points - self.center) - self.side_lengths / 2.0
+
+        signed_distance = torch.linalg.norm(
+            torch.maximum(diff, torch.zeros_like(diff)),
+            dim=-1
+        ) + torch.minimum(torch.max(diff, dim=-1)[0], torch.zeros_like(diff[..., 0]))
+
+        return signed_distance.unsqueeze(-1)
+
+# Torus SDF class
+class TorusSDF(torch.nn.Module):
+    def __init__(
+        self,
+        cfg
+    ):
+        super().__init__()
+
+        self.center = torch.nn.Parameter(
+            torch.tensor(cfg.center.val).float().unsqueeze(0), requires_grad=cfg.center.opt
+        )
+        self.radii = torch.nn.Parameter(
+            torch.tensor(cfg.radii.val).float().unsqueeze(0), requires_grad=cfg.radii.opt
+        )
+
+    def forward(self, points):
+        points = points.view(-1, 3)
+        diff = points - self.center
+        q = torch.stack(
+            [
+                torch.linalg.norm(diff[..., :2], dim=-1) - self.radii[..., 0],
+                diff[..., -1],
+            ],
+            dim=-1
+        )
+        return (torch.linalg.norm(q, dim=-1) - self.radii[..., 1]).unsqueeze(-1)
+
+
+class CombinedSDF(torch.nn.Module):
+    def __init__(
+        self,
+        cfg
+    ):
+        super().__init__()
+        self.center = torch.nn.Parameter(
+            torch.tensor(cfg.center.val).float().unsqueeze(0), requires_grad=cfg.center.opt
+        )
+        self.side_lengths = torch.nn.Parameter(
+            torch.tensor(cfg.side_lengths.val).float().unsqueeze(0), requires_grad=cfg.side_lengths.opt
+        )
+        self.objects = []
+        for obj_name, val in cfg.sdfs.items():
+            self.objects.append(sdf_dict[val.type](val).cuda())
+
+    def forward(self, points):
+        sdf_vals = [obj(points) for obj in self.objects]
+        return reduce(lambda x, y: torch.minimum(x, y), sdf_vals)
+        
+sdf_dict = {
+    'sphere': SphereSDF,
+    'box': BoxSDF,
+    'torus': TorusSDF,
+    'combined': CombinedSDF
+}
+
+
+# Converts SDF into density/feature volume
+class SDFVolume(torch.nn.Module):
+    def __init__(
+        self,
+        cfg
+    ):
+        super().__init__()
+
+        self.sdf = sdf_dict[cfg.sdf.type](
+            cfg.sdf
+        )
+
+        self.rainbow = cfg.feature.rainbow if 'rainbow' in cfg.feature else False
+        self.feature = torch.nn.Parameter(
+            torch.ones_like(torch.tensor(cfg.feature.val).float().unsqueeze(0)), requires_grad=cfg.feature.opt
+        )
+
+        self.alpha = torch.nn.Parameter(
+            torch.tensor(cfg.alpha.val).float(), requires_grad=cfg.alpha.opt
+        )
+        self.beta = torch.nn.Parameter(
+            torch.tensor(cfg.beta.val).float(), requires_grad=cfg.beta.opt
+        )
+
+    def _sdf_to_density(self, signed_distance):
+        # Convert signed distance to density with alpha, beta parameters
+        return torch.where(
+            signed_distance > 0,
+            0.5 * torch.exp(-signed_distance / self.beta),
+            1 - 0.5 * torch.exp(signed_distance / self.beta),
+        ) * self.alpha
+
+    def forward(self, ray_bundle):
+        sample_points = ray_bundle.sample_points.view(-1, 3)
+        depth_values = ray_bundle.sample_lengths[..., 0]
+        deltas = torch.cat(
+            (
+                depth_values[..., 1:] - depth_values[..., :-1],
+                1e10 * torch.ones_like(depth_values[..., :1]),
+            ),
+            dim=-1,
+        ).view(-1, 1)
+
+        # Transform SDF to density
+        signed_distance = self.sdf(ray_bundle.sample_points)
+        density = self._sdf_to_density(signed_distance)
+
+        # Outputs
+        if self.rainbow:
+            base_color = torch.clamp(
+                torch.abs(sample_points - self.sdf.center),
+                0.02,
+                0.98
+            )
+        else:
+            base_color = 1.0
+
+        out = {
+            'density': -torch.log(1.0 - density) / deltas,
+            'feature': base_color * self.feature * density.new_ones(sample_points.shape[0], 1)
+        }
+
+        return out
+
+
+# Converts SDF into density/feature volume
+class SDFSurface(torch.nn.Module):
+    def __init__(
+        self,
+        cfg
+    ):
+        super().__init__()
+
+        self.sdf = sdf_dict[cfg.sdf.type](
+            cfg.sdf
+        )
+        self.rainbow = cfg.feature.rainbow if 'rainbow' in cfg.feature else False
+        self.feature = torch.nn.Parameter(
+            torch.ones_like(torch.tensor(cfg.feature.val).float().unsqueeze(0)), requires_grad=cfg.feature.opt
+        )
+    
+    def get_distance(self, points):
+        points = points.view(-1, 3)
+        return self.sdf(points)
+
+    def get_color(self, points):
+        points = points.view(-1, 3)
+
+        # Outputs
+        if self.rainbow:
+            base_color = torch.clamp(
+                torch.abs(points - self.sdf.center),
+                0.02,
+                0.98
+            )
+        else:
+            base_color = 1.0
+
+        return base_color * self.feature * points.new_ones(points.shape[0], 1)
+    
+    def forward(self, points):
+        return self.get_distance(points)
+
+class HarmonicEmbedding(torch.nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        n_harmonic_functions: int = 6,
+        omega0: float = 1.0,
+        logspace: bool = True,
+        include_input: bool = True,
+    ) -> None:
+        super().__init__()
+
+        if logspace:
+            frequencies = 2.0 ** torch.arange(
+                n_harmonic_functions,
+                dtype=torch.float32,
+            )
+        else:
+            frequencies = torch.linspace(
+                1.0,
+                2.0 ** (n_harmonic_functions - 1),
+                n_harmonic_functions,
+                dtype=torch.float32,
+            )
+
+        self.register_buffer("_frequencies", omega0 * frequencies, persistent=False)
+        self.include_input = include_input
+        self.output_dim = n_harmonic_functions * 2 * in_channels
+
+        if self.include_input:
+            self.output_dim += in_channels
+
+    def forward(self, x: torch.Tensor):
+        embed = (x[..., None] * self._frequencies).view(*x.shape[:-1], -1)
+
+        if self.include_input:
+            return torch.cat((embed.sin(), embed.cos(), x), dim=-1)
+        else:
+            return torch.cat((embed.sin(), embed.cos()), dim=-1)
+
+
+class LinearWithRepeat(torch.nn.Linear):
+    def forward(self, input):
+        n1 = input[0].shape[-1]
+        output1 = F.linear(input[0], self.weight[:, :n1], self.bias)
+        output2 = F.linear(input[1], self.weight[:, n1:], None)
+        return output1 + output2.unsqueeze(-2)
+
+
+class MLPWithInputSkips(torch.nn.Module):
+    def __init__(
+        self,
+        n_layers: int,
+        input_dim: int,
+        output_dim: int,
+        skip_dim: int,
+        hidden_dim: int,
+        input_skips,
+    ):
+        super().__init__()
+
+        layers = []
+
+        for layeri in range(n_layers):
+            if layeri == 0:
+                dimin = input_dim
+                dimout = hidden_dim
+            elif layeri in input_skips:
+                dimin = hidden_dim + skip_dim
+                dimout = hidden_dim
+            else:
+                dimin = hidden_dim
+                dimout = hidden_dim
+
+            linear = torch.nn.Linear(dimin, dimout)
+            layers.append(torch.nn.Sequential(linear, torch.nn.ReLU(True)))
+
+        self.mlp = torch.nn.ModuleList(layers)
+        self._input_skips = set(input_skips)
+
+    def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        y = x
+
+        for li, layer in enumerate(self.mlp):
+            if li in self._input_skips:
+                y = torch.cat((y, z), dim=-1)
+
+            y = layer(y)
+
+        return y
+
+
+# TODO (Q3.1): Implement NeRF MLP
+class NeuralRadianceField(torch.nn.Module):
+    def __init__(
+        self,
+        cfg,
+    ):
+        super().__init__()
+
+        self.harmonic_embedding_xyz = HarmonicEmbedding(3, cfg.n_harmonic_functions_xyz)
+        self.harmonic_embedding_dir = HarmonicEmbedding(3, cfg.n_harmonic_functions_dir)
+
+        embedding_dim_xyz = self.harmonic_embedding_xyz.output_dim
+        embedding_dim_dir = self.harmonic_embedding_dir.output_dim
+
+        n_hidden_neurons_xyz = cfg.n_hidden_neurons_xyz
+        n_hidden_neurons_dir = cfg.n_hidden_neurons_dir
+        n_layers_xyz = cfg.n_layers_xyz
+        self.append_xyz = [0] + cfg.append_xyz
+        self.use_view_directions = cfg.use_view_directions
+
+        self.mlp_xyz = nn.Sequential(nn.Linear(embedding_dim_xyz, n_hidden_neurons_xyz))
+        for i in range(n_layers_xyz):
+            if i in cfg.append_xyz:
+                self.mlp_xyz.append(nn.Linear(n_hidden_neurons_xyz + embedding_dim_xyz, n_hidden_neurons_xyz))
+            else:
+                self.mlp_xyz.append(nn.Linear(n_hidden_neurons_xyz, n_hidden_neurons_xyz))
+            self.mlp_xyz.append(nn.ReLU())
+        
+        self.alpha_out = nn.Sequential(nn.Linear(n_hidden_neurons_xyz, 1), nn.ReLU())
+
+        if self.use_view_directions:
+            self.mlp_dir = nn.Sequential(nn.Linear(n_hidden_neurons_xyz + embedding_dim_dir, n_hidden_neurons_dir), nn.ReLU(),
+                                         nn.Linear(n_hidden_neurons_dir, n_hidden_neurons_dir), nn.ReLU(),
+                                         nn.Linear(n_hidden_neurons_dir, 3), nn.Sigmoid())
+    
+        else:
+            self.mlp_dir = nn.Sequential(nn.Linear(n_hidden_neurons_xyz, 3), nn.Sigmoid())
+    
+    def forward(self, ray_bundle):
+        points = ray_bundle.sample_points
+        dirs = ray_bundle.directions
+        xyz_feats = self.harmonic_embedding_xyz(points)
+        dirs_feats = self.harmonic_embedding_dir(dirs)
+
+        xyz_feats_org = xyz_feats
+        
+        for i in range(1, len(self.append_xyz)):
+            xyz_feats = self.mlp_xyz[self.append_xyz[i-1] * 2: self.append_xyz[i] * 2 + 1](xyz_feats)
+            xyz_feats = torch.concat([xyz_feats, xyz_feats_org], dim=-1)
+        xyz_feats = self.mlp_xyz[self.append_xyz[-1] * 2: ](xyz_feats)
+        
+        density = self.alpha_out(xyz_feats)
+
+        if self.use_view_directions:
+            dirs_feats = dirs_feats.unsqueeze(1).expand(-1, xyz_feats.shape[1], -1)
+            feats = torch.concat([xyz_feats, dirs_feats], dim=-1)
+            feature = self.mlp_dir(feats)
+        else:
+            feature = self.mlp_dir(xyz_feats)
+  
+        return {
+                'feature': feature,
+                'density': density,
+            }
+
+        
+        
+
+
+
+class NeuralSurface(torch.nn.Module):
+    def __init__(
+        self,
+        cfg,
+    ):
+        super().__init__()
+        # TODO (Q6): Implement Neural Surface MLP to output per-point SDF
+        # TODO (Q7): Implement Neural Surface MLP to output per-point color
+        self.harmonic_embedding_xyz = HarmonicEmbedding(3, cfg.n_harmonic_functions_xyz)
+
+        embedding_dim_xyz = self.harmonic_embedding_xyz.output_dim
+        n_hidden_neurons_distance = cfg.n_hidden_neurons_distance
+        n_layers_distance = cfg.n_layers_distance
+        n_layers_color = cfg.n_layers_color
+        n_hidden_neurons_color = cfg.n_hidden_neurons_color
+
+        self.mlp_xyz = nn.Sequential(nn.Linear(embedding_dim_xyz, n_hidden_neurons_distance))
+        for i in range(n_layers_distance):
+            self.mlp_xyz.append(nn.Linear(n_hidden_neurons_distance, n_hidden_neurons_distance))
+            self.mlp_xyz.append(nn.ReLU())
+
+        self.distance_out = nn.Sequential(nn.Linear(n_hidden_neurons_distance, 1))
+        
+        self.color_out = nn.Sequential(nn.Linear(n_hidden_neurons_distance, n_hidden_neurons_color))
+        for i in range(n_layers_color - 1):
+            self.color_out.append(nn.Linear(n_hidden_neurons_color, n_hidden_neurons_color))
+        self.color_out.append(nn.Sequential(nn.Linear(n_hidden_neurons_color, 3), nn.Sigmoid()))
+
+    def get_distance(
+        self,
+        points
+    ):
+        '''
+        TODO: Q6
+        Output:
+            distance: N X 1 Tensor, where N is number of input points
+        '''
+        points = points.view(-1, 3)
+        x = self.harmonic_embedding_xyz(points)
+        x = self.mlp_xyz(x)
+        distance = self.distance_out(x)
+        return distance
+    
+    def get_color(
+        self,
+        points
+    ):
+        '''
+        TODO: Q7
+        Output:
+            distance: N X 3 Tensor, where N is number of input points
+        '''
+        points = points.view(-1, 3)
+        x = self.harmonic_embedding_xyz(points)
+        x = self.mlp_xyz(x)
+        color = self.color_out(x)
+        return color
+    
+    def get_distance_color(
+        self,
+        points
+    ):
+        '''
+        TODO: Q7
+        Output:
+            distance, points: N X 1, N X 3 Tensors, where N is number of input points
+        You may just implement this by independent calls to get_distance, get_color
+            but, depending on your MLP implementation, it maybe more efficient to share some computation
+        '''
+        points = points.view(-1, 3)
+        x = self.harmonic_embedding_xyz(points)
+        x = self.mlp_xyz(x)
+        distance = self.distance_out(x)
+        color = self.color_out(x)
+        return distance, color
+        
+    def forward(self, points):
+        return self.get_distance(points)
+
+    def get_distance_and_gradient(
+        self,
+        points
+    ):
+        has_grad = torch.is_grad_enabled()
+        points = points.view(-1, 3)
+
+        # Calculate gradient with respect to points
+        with torch.enable_grad():
+            points = points.requires_grad_(True)
+            distance = self.get_distance(points)
+            gradient = autograd.grad(
+                distance,
+                points,
+                torch.ones_like(distance, device=points.device),
+                create_graph=has_grad,
+                retain_graph=has_grad,
+                only_inputs=True
+            )[0]
+        
+        return distance, gradient
+
+
+implicit_dict = {
+    'sdf_volume': SDFVolume,
+    'nerf': NeuralRadianceField,
+    'sdf_surface': SDFSurface,
+    'neural_surface': NeuralSurface,
+}
